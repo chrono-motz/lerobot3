@@ -32,6 +32,8 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, SamModel, SamProcessor
+from PIL import Image
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -94,8 +96,12 @@ class DiffusionPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+        batch_from_queue = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        # Merge, preferring queued history overrides
+        full_batch = dict(batch)
+        full_batch.update(batch_from_queue)
+        
+        actions = self.diffusion.generate_actions(full_batch, noise=noise)
 
         return actions
 
@@ -166,6 +172,26 @@ class DiffusionModel(nn.Module):
         super().__init__()
         self.config = config
 
+        # Initialize Grounding DINO and SAM
+        self.gd_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
+        self.gd_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny")
+        self.gd_model.eval()
+        for param in self.gd_model.parameters():
+            param.requires_grad = False
+
+        self.sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+        self.sam_model = SamModel.from_pretrained("facebook/sam-vit-base")
+        self.sam_model.eval() # Ensure inference mode
+        for param in self.sam_model.parameters():
+            param.requires_grad = False
+        
+        # Cache for SAM masks to avoid redundant computation
+        # Structure: {(episode_index, camera_key, frame_type): mask_tensor_cpu}
+        self.sam_mask_cache = {}
+        self.mask_vis_dir = "debug_sam_masks"
+        import os
+        os.makedirs(self.mask_vis_dir, exist_ok=True)
+
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
@@ -173,10 +199,12 @@ class DiffusionModel(nn.Module):
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
+                # We now have 3 features per camera: First(SAM), Last(SAM), Current(No SAM)
+                # Assuming config.image_features contains all cameras.
+                global_cond_dim += (encoders[0].feature_dim * 3) * num_images
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+                global_cond_dim += (self.rgb_encoder.feature_dim * 3) * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -235,36 +263,305 @@ class DiffusionModel(nn.Module):
 
         return sample
 
+    def precompute_sam_masks(self, dataset, batch_size: int = 8):
+        """
+        Precompute SAM masks for all episodes in the dataset and cache them.
+        After precomputation, the SAM model is deleted to save memory.
+        """
+        from torch.utils.data import DataLoader, Subset
+        import torch
+
+        print("Starting SAM mask precomputation...")
+        
+        # We only need to run this once per episode.
+        # We'll fetch the first frame of each episode to get the 'first' and 'last' images
+        # (since our dataset modification adds _first and _last to every item).
+        indices = []
+        if hasattr(dataset, "meta") and hasattr(dataset.meta, "episodes"):
+            for ep in dataset.meta.episodes:
+                indices.append(ep["dataset_from_index"])
+        else:
+            # Fallback estimation if metadata isn't easily accessible in that format:
+            # This is risky, but assuming standard LeRobot dataset structure
+            print("Warning: Could not access dataset metadata for optimized precomputation. Skipping precomputation.")
+            return
+
+        print(f"Found {len(indices)} episodes to process.")
+
+        # Create a subset of just the anchor frames
+        subset = Subset(dataset, indices)
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+        # Ensure models are on device
+        device = get_device_from_parameters(self)
+        self.gd_model.to(device)
+        self.sam_model.to(device)
+
+        count = 0
+        with torch.no_grad():
+            for batch in loader:
+                # batch is a collated dict
+                ep_indices = batch["episode_index"]
+                if isinstance(ep_indices, torch.Tensor):
+                    ep_indices = ep_indices.flatten().tolist()
+                
+                # Iterate cameras
+                if self.config.image_features:
+                    for key in self.config.image_features:
+                        # Process First
+                        if f"{key}_first" in batch:
+                            imgs = batch[f"{key}_first"]
+                            if isinstance(imgs, torch.Tensor):
+                                imgs = imgs.to(device)
+                                # This triggers the caching mechanism
+                                self._run_sam_to_mask(imgs, episode_indices=ep_indices, camera_key=key, frame_type="first")
+                        
+                        # Process Last
+                        if f"{key}_last" in batch:
+                            imgs = batch[f"{key}_last"]
+                            if isinstance(imgs, torch.Tensor):
+                                imgs = imgs.to(device)
+                                self._run_sam_to_mask(imgs, episode_indices=ep_indices, camera_key=key, frame_type="last")
+
+                count += len(ep_indices)
+                print(f"Precomputed SAM masks: {count}/{len(indices)}")
+
+        print("Precomputation finished. Deleting models to free VRAM.")
+        del self.gd_model
+        del self.gd_processor
+        del self.sam_model
+        del self.sam_processor
+        self.gd_model = None
+        self.gd_processor = None
+        self.sam_model = None
+        self.sam_processor = None
+        torch.cuda.empty_cache()
+
+    def _run_sam_to_mask(self, images: Tensor, episode_indices: list[int] | None = None, camera_key: str = None, frame_type: str = None) -> Tensor:
+        """Runs Grounded-SAM (GroundingDINO + SAM) on input images and returns the mask as a 3-channel image-like tensor.
+        Handles caching and saving visualization if episode_indices and meta info are provided.
+        """
+        # images: (B, 3, H, W)
+        B, C, H, W = images.shape
+        device = images.device
+
+        # If we can cache, check what we already have
+        computed_masks = [None] * B
+        indices_to_compute = []
+        
+        if episode_indices is not None and camera_key is not None and frame_type is not None:
+             for i, ep_idx in enumerate(episode_indices):
+                 cache_key = (ep_idx, camera_key, frame_type)
+                 if cache_key in self.sam_mask_cache:
+                     # Load from cache and move to correct device
+                     computed_masks[i] = self.sam_mask_cache[cache_key].to(device)
+                 else:
+                     indices_to_compute.append(i)
+        else:
+             indices_to_compute = list(range(B))
+
+        # If everything is cached, return early
+        if len(indices_to_compute) == 0:
+            return torch.stack(computed_masks)
+
+        # Verify models exist
+        if self.sam_model is None or self.gd_model is None:
+            raise RuntimeError(
+                "SAM or GroundingDINO model has been deleted but a mask was requested that was not in cache. "
+                "Ensure precompute_sam_masks is run for all episodes before training."
+            )
+
+        # Move models to device if needed
+        if self.gd_model.device != device:
+            self.gd_model.to(device)
+        if self.sam_model.device != device:
+            self.sam_model.to(device)
+        
+        # Prepare valid indices for computation
+        imgs_to_compute_tensor = images[indices_to_compute]
+        
+        # Convert to PIL for processors
+        pil_images = []
+        for i in range(len(indices_to_compute)):
+            img_t = imgs_to_compute_tensor[i]
+            img_np = img_t.permute(1, 2, 0).cpu().numpy()
+            if img_np.max() <= 1.5:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
+            pil_images.append(Image.fromarray(img_np))
+
+        # 1. Grounding DINO Detection
+        TEXT_PROMPT = "black tape . robotic arm ."
+        gd_inputs = self.gd_processor(images=pil_images, text=TEXT_PROMPT, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            gd_outputs = self.gd_model(**gd_inputs)
+            
+        target_sizes = [img.size[::-1] for img in pil_images]
+        try:
+            gd_results = self.gd_processor.post_process_grounded_object_detection(
+                gd_outputs, gd_inputs.input_ids, threshold=0.3, text_threshold=0.25, target_sizes=target_sizes
+            )
+        except TypeError:
+            gd_results = self.gd_processor.post_process_grounded_object_detection(
+                gd_outputs, gd_inputs.input_ids, target_sizes=target_sizes
+            )
+
+        # Filter boxes for 'tape'
+        batched_input_boxes = []
+        for result in gd_results:
+            tape_boxes = []
+            for box, label in zip(result["boxes"], result["labels"]):
+                if "tape" in label:
+                    tape_boxes.append(box.tolist())
+            batched_input_boxes.append(tape_boxes)
+
+        # 2. SAM Segmentation
+        final_masks = torch.zeros((len(indices_to_compute), 3, H, W), device=device)
+        
+        # Indices in the sub-batch (indices_to_compute) that have found boxes
+        has_box_indices = [i for i, b in enumerate(batched_input_boxes) if len(b) > 0]
+        
+        if len(has_box_indices) > 0:
+            sam_pil_images = [pil_images[i] for i in has_box_indices]
+            sam_boxes = [batched_input_boxes[i] for i in has_box_indices]
+            
+            sam_inputs = self.sam_processor(sam_pil_images, input_boxes=sam_boxes, return_tensors="pt").to(device)
+            with torch.no_grad():
+                sam_outputs = self.sam_model(**sam_inputs)
+                
+            sam_results = self.sam_processor.image_processor.post_process_masks(
+                sam_outputs.pred_masks, sam_inputs["original_sizes"], sam_inputs["reshaped_input_sizes"]
+            )
+            
+            for res_idx, masks_prob in enumerate(sam_results):
+                original_idx_in_batch = has_box_indices[res_idx]
+                
+                # Combine masks for multiple boxes in same image
+                combined_mask = torch.zeros((H, W), dtype=torch.bool, device=device)
+                for box_i in range(masks_prob.shape[0]):
+                    m = masks_prob[box_i, 0, :, :] # Best mask
+                    combined_mask = torch.logical_or(combined_mask, m.to(device))
+                
+                final_masks[original_idx_in_batch] = combined_mask.float().unsqueeze(0).repeat(3, 1, 1)
+
+        # Update results and cache
+        for i, original_idx in enumerate(indices_to_compute):
+            mask = final_masks[i]
+            computed_masks[original_idx] = mask
+            
+            # Cache and Save
+            if episode_indices is not None and camera_key is not None and frame_type is not None:
+                ep_idx = episode_indices[original_idx]
+                cache_key = (ep_idx, camera_key, frame_type)
+                
+                # Store in RAM (CPU to save VRAM)
+                self.sam_mask_cache[cache_key] = mask.detach().cpu()
+                
+                # Save to disk validation
+                import os
+                fname = f"{ep_idx}_{camera_key}_{frame_type}.png"
+                fpath = os.path.join(self.mask_vis_dir, fname)
+                try:
+                    torchvision.utils.save_image(mask, fpath)
+                except Exception as e:
+                    print(f"Failed to save mask visualization {fpath}: {e}")
+
+        return torch.stack(computed_masks)
+
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
+
+        # Extract episode indices for caching if available
+        # episode_index might be (B,) or (B, 1) or missing.
+        episode_indices = None
+        if "episode_index" in batch:
+            ep_idx_tensor = batch["episode_index"]
+            if ep_idx_tensor.dim() > 1:
+                ep_idx_tensor = ep_idx_tensor.flatten()
+            episode_indices = ep_idx_tensor.tolist()
+
         # Extract image features.
         if self.config.image_features:
+            # We expect keys like key, f"{key}_first", f"{key}_last" for each camera
+            
+            # 1. Process FIRST images (SAM Mask -> Encoder)
+            # 2. Process LAST images (SAM Mask -> Encoder)
+            # 3. Process CURRENT images (RGB -> Encoder)
+
             if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
+                # Iterate cameras
+                img_features_list = []
+                for i, (key, encoder) in enumerate(zip(self.config.image_features, self.rgb_encoder, strict=True)):
+                    # First Frame Mask
+                    if f"{key}_first" in batch:
+                        first_img = batch[f"{key}_first"] # (B, C, H, W)
+                        
+                        # Run SAM to get mask
+                        first_mask = self._run_sam_to_mask(first_img, episode_indices=episode_indices, camera_key=key, frame_type="first")
+                        # Encode Mask
+                        first_feat = encoder(first_mask) # (B, D)
+                        # Expand to match sequence length (B, S, D)
+                        first_feat = first_feat.unsqueeze(1).expand(-1, n_obs_steps, -1)
+                        img_features_list.append(first_feat)
+
+                    # Last Frame Mask
+                    if f"{key}_last" in batch:
+                        last_img = batch[f"{key}_last"]
+                        last_mask = self._run_sam_to_mask(last_img, episode_indices=episode_indices, camera_key=key, frame_type="last")
+                        last_feat = encoder(last_mask)
+                        last_feat = last_feat.unsqueeze(1).expand(-1, n_obs_steps, -1)
+                        img_features_list.append(last_feat)
+                        
+                    # Current Frame (Sequence)
+                    # Get from stacked OBS_IMAGES
+                    # OBS_IMAGES has shape (B, S, N, C, H, W)
+                    current_imgs_seq = batch[OBS_IMAGES][:, :, i] # (B, S, C, H, W)
+                    # Reshape to (B*S, C, H, W)
+                    b, s, c, h, w = current_imgs_seq.shape
+                    current_imgs_flat = current_imgs_seq.reshape(b*s, c, h, w)
+                    
+                    # Encode current images (RGB)
+                    current_feat_flat = encoder(current_imgs_flat)
+                    current_feat = current_feat_flat.reshape(b, s, -1)
+                    img_features_list.append(current_feat)
+
+                # Concatenate all features (B, S, Total_Visual_Features)
+                img_features = torch.cat(img_features_list, dim=-1)
+
             else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
+                 # Shared encoder
+                 img_features_list = []
+                 for i, key in enumerate(self.config.image_features):
+                    # First
+                    if f"{key}_first" in batch:
+                        first_img = batch[f"{key}_first"]
+                        first_mask = self._run_sam_to_mask(first_img, episode_indices=episode_indices, camera_key=key, frame_type="first")
+                        first_feat = self.rgb_encoder(first_mask)
+                        first_feat = first_feat.unsqueeze(1).expand(-1, n_obs_steps, -1)
+                        img_features_list.append(first_feat)
+                    
+                    # Last
+                    if f"{key}_last" in batch:
+                        last_img = batch[f"{key}_last"]
+                        last_mask = self._run_sam_to_mask(last_img, episode_indices=episode_indices, camera_key=key, frame_type="last")
+                        last_feat = self.rgb_encoder(last_mask)
+                        last_feat = last_feat.unsqueeze(1).expand(-1, n_obs_steps, -1)
+                        img_features_list.append(last_feat)
+
+                    # Current
+                    current_imgs_seq = batch[OBS_IMAGES][:, :, i]
+                    b, s, c, h, w = current_imgs_seq.shape
+                    current_imgs_flat = current_imgs_seq.reshape(b*s, c, h, w)
+                    current_feat_flat = self.rgb_encoder(current_imgs_flat)
+                    current_feat = current_feat_flat.reshape(b, s, -1)
+                    img_features_list.append(current_feat)
+                 
+                 img_features = torch.cat(img_features_list, dim=-1)
+
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
@@ -464,6 +761,7 @@ class DiffusionRgbEncoder(nn.Module):
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+
         if config.use_group_norm:
             if config.pretrained_backbone_weights:
                 raise ValueError(
@@ -484,7 +782,9 @@ class DiffusionRgbEncoder(nn.Module):
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
         dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+
+        in_channels = images_shape[0]
+        dummy_shape = (1, in_channels, *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)

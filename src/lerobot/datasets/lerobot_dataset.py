@@ -57,7 +57,6 @@ from lerobot.datasets.utils import (
     load_info,
     load_nested_dataset,
     load_stats,
-    load_subtasks,
     load_tasks,
     update_chunk_file_indices,
     validate_episode_buffer,
@@ -163,7 +162,6 @@ class LeRobotDatasetMetadata:
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks = load_tasks(self.root)
-        self.subtasks = load_subtasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
 
@@ -520,7 +518,6 @@ class LeRobotDatasetMetadata:
         _validate_feature_names(features)
 
         obj.tasks = None
-        obj.subtasks = None
         obj.episodes = None
         obj.stats = None
         obj.info = create_empty_dataset_info(
@@ -1070,20 +1067,43 @@ class LeRobotDataset(torch.utils.data.Dataset):
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
+            # --- START: Added logic for First and Last frame ---
+            # Retrieve First and Last frames for the episode
+            ep_length = self.meta.episodes[ep_idx]["length"]
+            # Timestamps are 0-based relative to episode start. 
+            # First frame is at 0.0s. Last frame is at (length-1)/fps
+            first_ts = 0.0
+            last_ts = (ep_length - 1) / self.meta.fps
+
+            # We use _query_videos which expects a dict of {key: [ts1, ts2...]}
+            # But here we want separate keys in the output item.
+            # We construct query independently for first and last to avoid modifying the main flow?
+            # Or use _query_videos helper.
+            
+            fl_timestamps_dict = {
+                key: [first_ts, last_ts] for key in self.meta.video_keys
+            }
+            # _query_videos returns {key: Tensor(2, C, H, W)}
+            fl_frames = self._query_videos(fl_timestamps_dict, ep_idx)
+            
+            for key, frames in fl_frames.items():
+                item[f"{key}_first"] = frames[0]
+                item[f"{key}_last"] = frames[1]
+            # --- END: Added logic for First and Last frame ---
+
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
+                # Also apply transforms to first/last if they exist
+                if f"{cam}_first" in item:
+                    item[f"{cam}_first"] = self.image_transforms(item[f"{cam}_first"])
+                if f"{cam}_last" in item:
+                    item[f"{cam}_last"] = self.image_transforms(item[f"{cam}_last"])
 
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks.iloc[task_idx].name
-
-        # add subtask information if available
-        if "subtask_index" in self.features and self.meta.subtasks is not None:
-            subtask_idx = item["subtask_index"].item()
-            item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
-
         return item
 
     def __repr__(self):
